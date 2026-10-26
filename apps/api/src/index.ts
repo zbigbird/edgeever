@@ -457,19 +457,118 @@ export const fetchEdgeEverApp = async (
     return app.fetch(request, runtimeEnv, ctx);
 };
 
+// ---------------------------------------------------------------------------
+// TEMPORARY DEPLOYMENT DIAGNOSTICS — remove this block once the deployment is
+// healthy. Exposes /api/__diag?k=<key> (bindings + Hono pipeline probe) and
+// turns uncaught request-time exceptions into readable JSON instead of 1101.
+// ---------------------------------------------------------------------------
+const EDGEEVER_DIAG_KEY = "ee-diag-7f3c9a";
+
+const diagJson = (payload: unknown, status = 200) =>
+  new Response(JSON.stringify(payload, null, 2), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
+
+const diagError = (error: unknown) => {
+  const value = error as { name?: string; message?: string; stack?: string } | undefined;
+  return {
+    name: value?.name ?? null,
+    message: value?.message ?? String(error),
+    stack: value?.stack ?? null,
+  };
+};
+
+const probe = async (label: string, run: () => Promise<unknown>) => {
+  try {
+    return { ok: true, value: await run() };
+  } catch (error) {
+    return { ok: false, error: diagError(error), label };
+  }
+};
+
+const runEdgeEverDiagnostics = async (request: Request, env: WorkerBindings) => {
+  const anyEnv = env as any;
+  return diagJson({
+    diag: "worker-fetch-reached",
+    at: new Date().toISOString(),
+    bindingTypes: {
+      DB: typeof anyEnv.DB,
+      RESOURCES: typeof anyEnv.RESOURCES,
+      ASSETS: typeof anyEnv.ASSETS,
+      CF_VERSION_METADATA: typeof anyEnv.CF_VERSION_METADATA,
+      EDGE_EVER_AUTH_PASSWORD: typeof anyEnv.EDGE_EVER_AUTH_PASSWORD,
+      EDGE_EVER_AUTH_PASSWORD_HASH: typeof anyEnv.EDGE_EVER_AUTH_PASSWORD_HASH,
+    },
+    vars: {
+      EDGE_EVER_AUTH_USERNAME: anyEnv.EDGE_EVER_AUTH_USERNAME ?? null,
+      EDGE_EVER_R2_BUCKET_NAME: anyEnv.EDGE_EVER_R2_BUCKET_NAME ?? null,
+    },
+    envKeys: Object.keys(anyEnv).sort(),
+    d1: await probe("d1", () => anyEnv.DB.prepare("SELECT 1 AS ok").first()),
+    r2: await probe("r2", async () => {
+      const listed = await anyEnv.RESOURCES.list({ limit: 1 });
+      return { truncated: listed.truncated, count: listed.objects.length };
+    }),
+    assets: await probe("assets", async () => {
+      const response = await anyEnv.ASSETS.fetch(new URL("/", request.url));
+      return { status: response.status, type: response.headers.get("content-type") };
+    }),
+    hono: await probe("hono", async () => {
+      const response = await app.request("/api/release");
+      return { status: response.status, body: (await response.text()).slice(0, 300) };
+    }),
+    storageAdapter: await probe("storage", async () => {
+      const adapter = createCloudflareStorageAdapter(env);
+      return { db: Boolean(adapter.db), resources: Boolean(adapter.resources) };
+    }),
+  });
+};
+
 const worker = {
   async fetch(request: Request, env: WorkerBindings, ctx: ExecutionContext) {
-    if (isNotebookSitePagePath(new URL(request.url).pathname)) {
-      return (await renderNotebookSitePage(request, createCloudflareStorageAdapter(env).db,
-        () => env.ASSETS.fetch(new Request(new URL("/", request.url), { method: "GET" }))))!;
+    const requestUrl = new URL(request.url);
+    if (
+      requestUrl.pathname === "/api/__diag"
+      && requestUrl.searchParams.get("k") === EDGEEVER_DIAG_KEY
+    ) {
+      try {
+        return await runEdgeEverDiagnostics(request, env);
+      } catch (error) {
+        return diagJson({ diag: "diagnostics-threw", error: diagError(error) }, 500);
+      }
     }
-    return fetchEdgeEverApp(request, {
-      ...env,
-      storage: createCloudflareStorageAdapter(env),
-      deploymentVersionCreatedAt: env.CF_VERSION_METADATA?.timestamp,
-      // workerd's default Internet egress checks resolved addresses against its public-only network policy.
-      publicNetworkFetch: (url, init) => fetch(url, init),
-    }, ctx);
+
+    const safeCtx = {
+      waitUntil: (promise: Promise<unknown>) => {
+        ctx.waitUntil(
+          Promise.resolve(promise).catch((error) => {
+            console.error("[diag] waitUntil rejected", error);
+          }),
+        );
+      },
+      passThroughOnException: () => ctx.passThroughOnException(),
+    } as unknown as ExecutionContext;
+
+    try {
+      if (isNotebookSitePagePath(requestUrl.pathname)) {
+        return (await renderNotebookSitePage(request, createCloudflareStorageAdapter(env).db,
+          () => env.ASSETS.fetch(new Request(new URL("/", request.url), { method: "GET" }))))!;
+      }
+      return await fetchEdgeEverApp(request, {
+        ...env,
+        storage: createCloudflareStorageAdapter(env),
+        deploymentVersionCreatedAt: env.CF_VERSION_METADATA?.timestamp,
+        // workerd's default Internet egress checks resolved addresses against its public-only network policy.
+        publicNetworkFetch: (url, init) => fetch(url, init),
+      }, safeCtx);
+    } catch (error) {
+      console.error("[diag] uncaught exception in worker.fetch", error);
+      return diagJson({ diag: "uncaught-in-worker-fetch", error: diagError(error) }, 500);
+    }
   },
   async scheduled(controller: ScheduledController, env: WorkerBindings, ctx: ExecutionContext) {
     const runtimeEnv = {
